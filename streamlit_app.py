@@ -1,249 +1,237 @@
+import os
+from docx import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from openai import AzureOpenAI
+import httpx
+import requests
+import json
+import openai
+import pinecone
+from langchain.document_loaders import DirectoryLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import Pinecone
+from langchain.llms import OpenAI
+import boto3
+from langchain.chains.question_answering import load_qa_chain
+# Initialize a session using Amazon S3
+import botocore
+import io
+import base64
 import streamlit as st
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error, r2_score
-import altair as alt
-import time
-import zipfile
 
-# Page title
-st.set_page_config(page_title='ML Model Building', page_icon='🤖')
-st.title('🤖 ML Model Building')
+bucket_name = 'emd-forecast'
+prefix = 'gtn/input/knowledge_base/'  # Replace with your actual prefix
+s3 = boto3.client(
+    "s3",
+    aws_access_key_id=st.secrets["aws_access_key_id"],
+    aws_secret_access_key=st.secrets["aws_secret_access_key"],
+    verify=False
+)
 
-with st.expander('About this app'):
-  st.markdown('**What can this app do?**')
-  st.info('This app allow users to build a machine learning (ML) model in an end-to-end workflow. Particularly, this encompasses data upload, data pre-processing, ML model building and post-model analysis.')
+def load_docx(file_content):
+    # Read the DOCX file content and return the text
+    doc = Document(io.BytesIO(file_content))
+    full_text = []
+    for para in doc.paragraphs:
+        full_text.append(para.text)
+    return '\n'.join(full_text)
 
-  st.markdown('**How to use the app?**')
-  st.warning('To engage with the app, go to the sidebar and 1. Select a data set and 2. Adjust the model parameters by adjusting the various slider widgets. As a result, this would initiate the ML model building process, display the model results as well as allowing users to download the generated models and accompanying data.')
+def load_docs_from_s3(bucket_name, prefix):
+    documents = []
+    try:
+        # List all objects in the S3 bucket with the specified prefix
+        response = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+        for obj in response.get('Contents', []):
+            if obj['Key'].endswith('.docx'):
+                # Read the file content from S3
+                file_obj = s3.get_object(Bucket=bucket_name, Key=obj['Key'])
+                file_content = file_obj['Body'].read()
+                text = load_docx(file_content)
+                if text:
+                    documents.append((obj['Key'], text))  # Store filename and text together
+    except Exception as e:
+        print(f"Error accessing S3 bucket: {e}")
+    return documents
 
-  st.markdown('**Under the hood**')
-  st.markdown('Data sets:')
-  st.code('''- Drug solubility data set
-  ''', language='markdown')
-  
-  st.markdown('Libraries used:')
-  st.code('''- Pandas for data wrangling
-- Scikit-learn for building a machine learning model
-- Altair for chart creation
-- Streamlit for user interface
-  ''', language='markdown')
+# Split documents into chunks
+def split_docs(documents, chunk_size=1000, chunk_overlap=20):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    docs = []
+    for doc_id, doc in documents:
+        splits = text_splitter.split_text(doc)
+        docs.extend([(doc_id, split) for split in splits])
+    return docs
+
+# Load documents from a directory
+documents = load_docs_from_s3(bucket_name, prefix)
+print(f"Number of documents loaded: {len([d[0] for d in documents])}")
+
+# Split documents into chunks
+docs = split_docs(documents)
+print(f"Number of split documents: {len(docs)}")
+
+# Initialize HTTP client
+httpx_client = httpx.Client(http2=True, verify='cacert.pem')
+
+# Initialize AzureOpenAI client with the HTTP client
+client = AzureOpenAI(
+    azure_endpoint=st.secrets["azure_endpoint"],
+    api_key=st.secrets["api_key"],
+    api_version=st.secrets["api_version"],
+    http_client=httpx_client
+)
+
+# Generate embeddings for all document chunks
+embeddings = []
+
+for doc_id, doc in docs:
+    text = doc
+    embedding_response = client.embeddings.create(input=text, model="text-embedding-ada-002-v2")
+    if embedding_response is not None:
+        embedding = embedding_response.data[0].embedding
+        embeddings.append((embedding, doc_id, text))
+
+p_api_key = st.secrets["api_key"]
+
+base_url = st.secrets["base_url"]
 
 
-# Sidebar for accepting input parameters
-with st.sidebar:
-    # Load data
-    st.header('1.1. Input data')
+upsert_endpoint = f"{base_url}/vectors/upsert"
+query_endpoint = f"{base_url}/vectors/query"
 
-    st.markdown('**1. Use custom data**')
-    uploaded_file = st.file_uploader("Upload a CSV file", type=["csv"])
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file, index_col=False)
-      
-    # Download example data
-    @st.cache_data
-    def convert_df(input_df):
-        return input_df.to_csv(index=False).encode('utf-8')
-    example_csv = pd.read_csv('https://raw.githubusercontent.com/dataprofessor/data/master/delaney_solubility_with_descriptors.csv')
-    csv = convert_df(example_csv)
-    st.download_button(
-        label="Download example CSV",
-        data=csv,
-        file_name='delaney_solubility_with_descriptors.csv',
-        mime='text/csv',
-    )
+# Headers with API key
+headers = {
+    "Content-Type": "application/json",
+    "Api-Key": p_api_key
+}
 
-    # Select example data
-    st.markdown('**1.2. Use example data**')
-    example_data = st.toggle('Load example data')
-    if example_data:
-        df = pd.read_csv('https://raw.githubusercontent.com/dataprofessor/data/master/delaney_solubility_with_descriptors.csv')
+dimension = 1536
+for embed, doc_id, text in embeddings:
+    assert len(embed) == dimension, "Embedding dimension mismatch"
 
-    st.header('2. Set Parameters')
-    parameter_split_size = st.slider('Data split ratio (% for Training Set)', 10, 90, 80, 5)
+# Prepare the data to be added to the index
+data = {
+    "vectors": [
+        {
+           "id": f"{doc_id}-{i}",
+            "values": embed,
+            "metadata": {"text": text} 
+        }
+        for i, (embed, doc_id, text) in enumerate(embeddings)
+    ]
+}
 
-    st.subheader('2.1. Learning Parameters')
-    with st.expander('See parameters'):
-        parameter_n_estimators = st.slider('Number of estimators (n_estimators)', 0, 1000, 100, 100)
-        parameter_max_features = st.select_slider('Max features (max_features)', options=['all', 'sqrt', 'log2'])
-        parameter_min_samples_split = st.slider('Minimum number of samples required to split an internal node (min_samples_split)', 2, 10, 2, 1)
-        parameter_min_samples_leaf = st.slider('Minimum number of samples required to be at a leaf node (min_samples_leaf)', 1, 10, 2, 1)
+# Make the POST request to upsert data
+response = requests.post(upsert_endpoint, headers=headers, json=data, verify=False)
 
-    st.subheader('2.2. General Parameters')
-    with st.expander('See parameters', expanded=False):
-        parameter_random_state = st.slider('Seed number (random_state)', 0, 1000, 42, 1)
-        parameter_criterion = st.select_slider('Performance measure (criterion)', options=['squared_error', 'absolute_error', 'friedman_mse'])
-        parameter_bootstrap = st.select_slider('Bootstrap samples when building trees (bootstrap)', options=[True, False])
-        parameter_oob_score = st.select_slider('Whether to use out-of-bag samples to estimate the R^2 on unseen data (oob_score)', options=[False, True])
-
-    sleep_time = st.slider('Sleep time', 0, 3, 0)
-
-# Initiate the model building process
-if uploaded_file or example_data: 
-    with st.status("Running ...", expanded=True) as status:
-    
-        st.write("Loading data ...")
-        time.sleep(sleep_time)
-
-        st.write("Preparing data ...")
-        time.sleep(sleep_time)
-        X = df.iloc[:,:-1]
-        y = df.iloc[:,-1]
-            
-        st.write("Splitting data ...")
-        time.sleep(sleep_time)
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=(100-parameter_split_size)/100, random_state=parameter_random_state)
-    
-        st.write("Model training ...")
-        time.sleep(sleep_time)
-
-        if parameter_max_features == 'all':
-            parameter_max_features = None
-            parameter_max_features_metric = X.shape[1]
-        
-        rf = RandomForestRegressor(
-                n_estimators=parameter_n_estimators,
-                max_features=parameter_max_features,
-                min_samples_split=parameter_min_samples_split,
-                min_samples_leaf=parameter_min_samples_leaf,
-                random_state=parameter_random_state,
-                criterion=parameter_criterion,
-                bootstrap=parameter_bootstrap,
-                oob_score=parameter_oob_score)
-        rf.fit(X_train, y_train)
-        
-        st.write("Applying model to make predictions ...")
-        time.sleep(sleep_time)
-        y_train_pred = rf.predict(X_train)
-        y_test_pred = rf.predict(X_test)
-            
-        st.write("Evaluating performance metrics ...")
-        time.sleep(sleep_time)
-        train_mse = mean_squared_error(y_train, y_train_pred)
-        train_r2 = r2_score(y_train, y_train_pred)
-        test_mse = mean_squared_error(y_test, y_test_pred)
-        test_r2 = r2_score(y_test, y_test_pred)
-        
-        st.write("Displaying performance metrics ...")
-        time.sleep(sleep_time)
-        parameter_criterion_string = ' '.join([x.capitalize() for x in parameter_criterion.split('_')])
-        #if 'Mse' in parameter_criterion_string:
-        #    parameter_criterion_string = parameter_criterion_string.replace('Mse', 'MSE')
-        rf_results = pd.DataFrame(['Random forest', train_mse, train_r2, test_mse, test_r2]).transpose()
-        rf_results.columns = ['Method', f'Training {parameter_criterion_string}', 'Training R2', f'Test {parameter_criterion_string}', 'Test R2']
-        # Convert objects to numerics
-        for col in rf_results.columns:
-            rf_results[col] = pd.to_numeric(rf_results[col], errors='ignore')
-        # Round to 3 digits
-        rf_results = rf_results.round(3)
-        
-    status.update(label="Status", state="complete", expanded=False)
-
-    # Display data info
-    st.header('Input data', divider='rainbow')
-    col = st.columns(4)
-    col[0].metric(label="No. of samples", value=X.shape[0], delta="")
-    col[1].metric(label="No. of X variables", value=X.shape[1], delta="")
-    col[2].metric(label="No. of Training samples", value=X_train.shape[0], delta="")
-    col[3].metric(label="No. of Test samples", value=X_test.shape[0], delta="")
-    
-    with st.expander('Initial dataset', expanded=True):
-        st.dataframe(df, height=210, use_container_width=True)
-    with st.expander('Train split', expanded=False):
-        train_col = st.columns((3,1))
-        with train_col[0]:
-            st.markdown('**X**')
-            st.dataframe(X_train, height=210, hide_index=True, use_container_width=True)
-        with train_col[1]:
-            st.markdown('**y**')
-            st.dataframe(y_train, height=210, hide_index=True, use_container_width=True)
-    with st.expander('Test split', expanded=False):
-        test_col = st.columns((3,1))
-        with test_col[0]:
-            st.markdown('**X**')
-            st.dataframe(X_test, height=210, hide_index=True, use_container_width=True)
-        with test_col[1]:
-            st.markdown('**y**')
-            st.dataframe(y_test, height=210, hide_index=True, use_container_width=True)
-
-    # Zip dataset files
-    df.to_csv('dataset.csv', index=False)
-    X_train.to_csv('X_train.csv', index=False)
-    y_train.to_csv('y_train.csv', index=False)
-    X_test.to_csv('X_test.csv', index=False)
-    y_test.to_csv('y_test.csv', index=False)
-    
-    list_files = ['dataset.csv', 'X_train.csv', 'y_train.csv', 'X_test.csv', 'y_test.csv']
-    with zipfile.ZipFile('dataset.zip', 'w') as zipF:
-        for file in list_files:
-            zipF.write(file, compress_type=zipfile.ZIP_DEFLATED)
-
-    with open('dataset.zip', 'rb') as datazip:
-        btn = st.download_button(
-                label='Download ZIP',
-                data=datazip,
-                file_name="dataset.zip",
-                mime="application/octet-stream"
-                )
-    
-    # Display model parameters
-    st.header('Model parameters', divider='rainbow')
-    parameters_col = st.columns(3)
-    parameters_col[0].metric(label="Data split ratio (% for Training Set)", value=parameter_split_size, delta="")
-    parameters_col[1].metric(label="Number of estimators (n_estimators)", value=parameter_n_estimators, delta="")
-    parameters_col[2].metric(label="Max features (max_features)", value=parameter_max_features_metric, delta="")
-    
-    # Display feature importance plot
-    importances = rf.feature_importances_
-    feature_names = list(X.columns)
-    forest_importances = pd.Series(importances, index=feature_names)
-    df_importance = forest_importances.reset_index().rename(columns={'index': 'feature', 0: 'value'})
-    
-    bars = alt.Chart(df_importance).mark_bar(size=40).encode(
-             x='value:Q',
-             y=alt.Y('feature:N', sort='-x')
-           ).properties(height=250)
-
-    performance_col = st.columns((2, 0.2, 3))
-    with performance_col[0]:
-        st.header('Model performance', divider='rainbow')
-        st.dataframe(rf_results.T.reset_index().rename(columns={'index': 'Parameter', 0: 'Value'}))
-    with performance_col[2]:
-        st.header('Feature importance', divider='rainbow')
-        st.altair_chart(bars, theme='streamlit', use_container_width=True)
-
-    # Prediction results
-    st.header('Prediction results', divider='rainbow')
-    s_y_train = pd.Series(y_train, name='actual').reset_index(drop=True)
-    s_y_train_pred = pd.Series(y_train_pred, name='predicted').reset_index(drop=True)
-    df_train = pd.DataFrame(data=[s_y_train, s_y_train_pred], index=None).T
-    df_train['class'] = 'train'
-        
-    s_y_test = pd.Series(y_test, name='actual').reset_index(drop=True)
-    s_y_test_pred = pd.Series(y_test_pred, name='predicted').reset_index(drop=True)
-    df_test = pd.DataFrame(data=[s_y_test, s_y_test_pred], index=None).T
-    df_test['class'] = 'test'
-    
-    df_prediction = pd.concat([df_train, df_test], axis=0)
-    
-    prediction_col = st.columns((2, 0.2, 3))
-    
-    # Display dataframe
-    with prediction_col[0]:
-        st.dataframe(df_prediction, height=320, use_container_width=True)
-
-    # Display scatter plot of actual vs predicted values
-    with prediction_col[2]:
-        scatter = alt.Chart(df_prediction).mark_circle(size=60).encode(
-                        x='actual',
-                        y='predicted',
-                        color='class'
-                  )
-        st.altair_chart(scatter, theme='streamlit', use_container_width=True)
-
-    
-# Ask for CSV upload if none is detected
+# Check if the request was successful
+if response.status_code == 200:
+    print("Data upserted successfully.")
 else:
-    st.warning('👈 Upload a CSV file or click *"Load example data"* to get started!')
+    print(f"Failed to upsert data: {response.status_code} - {response.reason}")
+    print("Response content:", response.text)
+    
+    
+doc_text_dict = {f"{doc_id}-{i}": text for i, (embed, doc_id, text) in enumerate(embeddings)}
+# Preprocess the id to extract a consistent format
+# Preprocess the id to extract a consistent format
+def preprocess_id(id_str):
+    if id_str.startswith("page_content="):
+        return id_str.split("=")[1].strip("'")
+    else:
+        return id_str
+
+
+
+# Update the get_similar_docs function to preprocess the id before retrieval
+def get_similar_docs(query, k=2, score=False):
+    # Generate the embedding for the query
+    query_embedding_response = client.embeddings.create(input=query, model="text-embedding-ada-002-v2")
+    query_embedding = query_embedding_response.data[0].embedding
+    
+    # Search the Pinecone index for similar documents
+    query_payload = {
+        "top_k": k,
+        "include_values": score,
+        "vector": query_embedding
+    }
+    query_endpoint = f"{base_url}/query"
+    query_response = requests.post(query_endpoint, headers=headers, json=query_payload, verify=False)
+    
+    # Extract and return the similar documents
+    if query_response.status_code == 200:
+        search_results = query_response.json()
+        print(search_results)
+        similar_docs = [doc_text_dict[preprocess_id(match['id'])] for match in search_results['matches']]
+        return similar_docs
+    else:
+        print(f"Failed to retrieve similar documents: {query_response.status_code} - {query_response.reason}")
+        print("Response content:", query_response.text)
+        return []
+
+
+def get_answer(query):
+    similar_docs = get_similar_docs(query)
+    combined_message = f"Question: {query}\nDocuments: {similar_docs}"
+    openai_key = st.secrets["openai_key"]
+    openai_url = st.secrets["openai_url"]
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": openai_key,
+        "region": "EU"
+    }
+    
+    payload = {
+        "model": "gpt-4-turbo",
+        "messages": [
+            {"role": "user", "content": combined_message}
+        ],
+        "max_tokens": 1024,
+        "n": 1,
+        "temperature": 0
+    }
+
+    try:
+        response = requests.post(openai_url, headers=headers, data=json.dumps(payload), verify=False)
+        response.raise_for_status()  # Raise an exception for HTTP errors
+        ChatGPT_reply = response.json()["choices"][0]["message"]["content"]
+        return ChatGPT_reply
+    except requests.exceptions.RequestException as e:
+        print("ERROR")
+        print(e)
+        raise Exception(f'Request failed: {e}')
+
+
+
+
+
+file_key = 'gtn/input/logo_ktbot.PNG'
+
+# Download the file from S3
+response = s3.get_object(Bucket=bucket_name, Key=file_key)
+file_content = response['Body'].read()
+
+# Encode the file content in base64
+png_base64 = base64.b64encode(file_content).decode('utf-8')
+png_data_url = f"data:image/png;base64,{png_base64}"
+
+
+# Streamlit App
+st.set_page_config(page_title="KT Bot", layout="wide")
+
+st.sidebar.image(png_data_url, use_column_width=True)
+
+st.title("KT Bot")
+st.write("Ask any question related to the knowledge base")
+
+user_input = st.text_input("Query:", "")
+if st.button("SEND"):
+    if user_input:
+        st.write("Processing...")
+        try:
+            response = get_answer(user_input)
+            st.write("**Answer:**")
+            st.write(response)
+        except Exception as e:
+            st.error(f"An error occurred: {e}")
