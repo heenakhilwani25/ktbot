@@ -1,6 +1,6 @@
 boto3==1.28.44
 docx==0.2.4
-httpx==0.26.0
+httpx[http2]==0.26.0
 langchain==0.2.0
 openai==1.30.1
 pandas==2.2.2
