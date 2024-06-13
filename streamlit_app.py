@@ -21,6 +21,7 @@ import base64
 import streamlit as st
 
 bucket_name = 'emd-forecast'
+file_key="gtn/input/cacert.pem"
 prefix = 'gtn/input/knowledge_base/'  # Replace with your actual prefix
 s3 = boto3.client(
     "s3",
@@ -72,6 +73,25 @@ docs = split_docs(documents)
 print(f"Number of split documents: {len(docs)}")
 
 # Initialize HTTP client
+
+def download_file_from_s3(bucket_name, file_key):
+    try:
+        response = s3.get_object(Bucket=bucket_name, Key=file_key)
+        file_content = response['Body'].read()
+        return file_content
+    except Exception as e:
+        print(f"Error downloading file from S3: {e}")
+        return None
+
+# Download the cacert.pem file
+cacert_content = download_file_from_s3(bucket_name, file_key)
+
+# Save the cacert.pem file locally
+if cacert_content:
+    with open('cacert.pem', 'wb') as f:
+        f.write(cacert_content)
+
+# Use the downloaded cacert.pem file with httpx.Client
 httpx_client = httpx.Client(http2=True, verify='cacert.pem')
 
 # Initialize AzureOpenAI client with the HTTP client
