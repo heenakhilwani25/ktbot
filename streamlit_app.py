@@ -71,48 +71,19 @@ print(f"Number of documents loaded: {len([d[0] for d in documents])}")
 # Split documents into chunks
 docs = split_docs(documents)
 print(f"Number of split documents: {len(docs)}")
-
-# Initialize HTTP client
-
-def download_file_from_s3(bucket_name, file_key):
-    try:
-        response = s3.get_object(Bucket=bucket_name, Key=file_key)
-        file_content = response['Body'].read()
-        return file_content
-    except Exception as e:
-        print(f"Error downloading file from S3: {e}")
-        return None
-
-# Download the cacert.pem file
-cacert_content = download_file_from_s3(bucket_name, file_key)
-
-# Save the cacert.pem file locally
-if cacert_content:
-    with open('cacert.pem', 'wb') as f:
-        f.write(cacert_content)
-
-# Use the downloaded cacert.pem file with httpx.Client
-httpx_client = httpx.Client(http2=True, verify='cacert.pem')
-
-# Initialize AzureOpenAI client with the HTTP client
-client = AzureOpenAI(
-    azure_endpoint=st.secrets["azure_endpoint"],
-    api_key=st.secrets["api_key"],
-    api_version=st.secrets["api_version"],
-    http_client=httpx_client
-)
-
-# Generate embeddings for all document chunks
 embeddings = []
+openai.api_key = st.secrets["api_key"]
 
 for doc_id, doc in docs:
     text = doc
-    embedding_response = client.embeddings.create(input=text, model="text-embedding-ada-002-v2")
+    embedding_response = openai.embeddings.create(input=text, model="text-embedding-ada-002")
+    print(embedding_response)
     if embedding_response is not None:
         embedding = embedding_response.data[0].embedding
         embeddings.append((embedding, doc_id, text))
 
-p_api_key = st.secrets["api_key"]
+# Initialize HTTP client
+p_api_key = st.secrets["p_api_key"]
 
 base_url = st.secrets["base_url"]
 
@@ -194,33 +165,23 @@ def get_similar_docs(query, k=2, score=False):
 def get_answer(query):
     similar_docs = get_similar_docs(query)
     combined_message = f"Question: {query}\nDocuments: {similar_docs}"
-    openai_key = st.secrets["openai_key"]
-    openai_url = st.secrets["openai_url"]
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": openai_key,
-        "region": "EU"
-    }
-    
-    payload = {
-        "model": "gpt-4-turbo",
-        "messages": [
-            {"role": "user", "content": combined_message}
-        ],
-        "max_tokens": 1024,
-        "n": 1,
-        "temperature": 0
-    }
+    client = OpenAI(
+    # This is the default and can be omitted
+    api_key =  st.secrets["api_key"]
+    )
 
-    try:
-        response = requests.post(openai_url, headers=headers, data=json.dumps(payload), verify=False)
-        response.raise_for_status()  # Raise an exception for HTTP errors
-        ChatGPT_reply = response.json()["choices"][0]["message"]["content"]
-        return ChatGPT_reply
-    except requests.exceptions.RequestException as e:
-        print("ERROR")
-        print(e)
-        raise Exception(f'Request failed: {e}')
+    chat_completion = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {
+                    "role": "user",
+                    "content": combined_message
+                }
+            ]
+    )
+
+    ChatGPT_reply = chat_completion.choices[0].message.content
+    return ChatGPT_reply
 
 
 
