@@ -8,4 +8,4 @@ pinecone-client==4.1.0
 streamlit==1.32.2
 requests==2.28.1
 python-docx==0.8.11
-langchain-community==0.0.37
+langchain-community
